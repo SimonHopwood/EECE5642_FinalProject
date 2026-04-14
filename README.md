@@ -1,10 +1,9 @@
-# 🎈 Blank app template
-
-A simple Streamlit app template for you to modify!
+Built from streamlit blank template in a Github workspace. 
+Made by Bailey Hopwood and Alexander Hunt
 
 [![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
 
-### How to run it on your own machine
+HOW TO RUN LOCALLY
 
 1. Install the requirements
 
