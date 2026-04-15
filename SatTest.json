@@ -1,5 +1,0 @@
-[
-  { "name": "Sat A", "lon": -30, "lat": 15, "alt": 500000 },
-  { "name": "Sat B", "lon": 80, "lat": -10, "alt": 700000 },
-  { "name": "Sat C", "lon": 140, "lat": 35, "alt": 900000 }
-]

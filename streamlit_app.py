@@ -1,552 +1,76 @@
-import streamlit as st
 import pandas as pd
 import pydeck as pdk
-import json
-import altair as alt
+import streamlit as st
+
+import charts
+import data
+import filters
+import map_utils
+from constants import OUTCOME_COLS
 
 st.set_page_config(layout="wide")
 st.title("OSHA Severe Injury Database Visualization Demo")
 
-# -----------------------------
-# Data loading
-# -----------------------------
-@st.cache_data
-def load_full_data():
-    df = pd.read_csv("January2015toAugust2025.csv")
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
 
-    string_cols = [
-        "ID",
-        "Employer",
-        "Nature",
-        "NatureTitle",
-        "Part of Body",
-        "Part of Body Title",
-        "Source",
-        "SourceTitle",
-        "Event",
-        "EventTitle",
-        "State",
-    ]
+filters.init_session_state()
 
-    for col in string_cols:
-        if col in df.columns:
-            df[col] = df[col].astype("string").str.strip()
+full_df     = data.load_injury_data()
+states_json = data.load_state_boundaries()
 
-    return df
+# ---------------------------------------------------------------------------
+# Sidebar: filter form
+# ---------------------------------------------------------------------------
 
+filters.render_filter_sidebar()
 
-@st.cache_data
-def load_states():
-    with open("StateBoundryData.json", "r") as f:
-        return json.load(f)
+# ---------------------------------------------------------------------------
+# Apply filters and show status
+# ---------------------------------------------------------------------------
 
+applied     = filters.get_applied_filters()
+filtered_df = data.apply_prefix_filters(full_df, **applied)
 
-def build_map_data(df):
-    map_df = df[["Latitude", "Longitude", "ID"]].copy()
-
-    map_df = map_df.rename(columns={
-        "Latitude": "lat",
-        "Longitude": "lon"
-    })
-
-    map_df["lat"] = pd.to_numeric(map_df["lat"], errors="coerce")
-    map_df["lon"] = pd.to_numeric(map_df["lon"], errors="coerce")
-    map_df["ID"] = map_df["ID"].astype("string")
-
-    map_df = map_df.dropna(subset=["lat", "lon", "ID"])
-    return map_df
-
-
-def apply_prefix_filter(df, column_name, code_value):
-    if not code_value:
-        return df
-
-    if column_name not in df.columns:
-        return df
-
-    code_value = str(code_value).strip()
-    if code_value == "":
-        return df
-
-    working_col = df[column_name].astype("string").str.strip()
-    return df[working_col.str.startswith(code_value, na=False)]
-
-
-def build_state_summary(df):
-    if "State" not in df.columns:
-        return pd.DataFrame(columns=["State", "Count"])
-
-    state_df = df[["State"]].copy()
-    state_df["State"] = state_df["State"].astype("string").str.strip()
-    state_df = state_df.dropna(subset=["State"])
-    state_df = state_df[state_df["State"] != ""]
-
-    summary = (
-        state_df.groupby("State")
-        .size()
-        .reset_index(name="Count")
-        .sort_values("Count", ascending=False)
-    )
-
-    return summary
-
-
-def build_top_counts(df, column_name, top_n=10):
-    if column_name not in df.columns:
-        return pd.DataFrame(columns=[column_name, "Count"])
-
-    working = df[[column_name]].copy()
-    working[column_name] = working[column_name].astype("string").str.strip()
-    working = working.dropna(subset=[column_name])
-    working = working[working[column_name] != ""]
-
-    summary = (
-        working.groupby(column_name)
-        .size()
-        .reset_index(name="Count")
-        .sort_values("Count", ascending=False)
-        .head(top_n)
-    )
-
-    return summary
-
-
-def build_top_code_title_counts(df, code_col, title_col, top_n=10):
-    missing_cols = [col for col in [code_col, title_col] if col not in df.columns]
-    if missing_cols:
-        return pd.DataFrame(columns=[code_col, title_col, "Label", "Count"])
-
-    working = df[[code_col, title_col]].copy()
-    working[code_col] = working[code_col].astype("string").str.strip()
-    working[title_col] = working[title_col].astype("string").str.strip()
-
-    working = working.dropna(subset=[code_col, title_col])
-    working = working[(working[code_col] != "") & (working[title_col] != "")]
-
-    summary = (
-        working.groupby([code_col, title_col])
-        .size()
-        .reset_index(name="Count")
-        .sort_values("Count", ascending=False)
-        .head(top_n)
-    )
-
-    summary["Label"] = summary[title_col]
-
-    return summary
-
-
-# -----------------------------
-# Load data
-# -----------------------------
-full_df = load_full_data()
-states_json = load_states()
-
-# -----------------------------
-# Session state
-# -----------------------------
-if "selected_ids" not in st.session_state:
-    st.session_state.selected_ids = []
-
-if "selected_case_dropdown" not in st.session_state:
-    st.session_state.selected_case_dropdown = None
-
-if "applied_filters" not in st.session_state:
-    st.session_state.applied_filters = {
-        "nature": "",
-        "part": "",
-        "source": "",
-        "event": "",
-    }
-
-# -----------------------------
-# Sidebar filter form
-# Filters only apply after submit
-# -----------------------------
-with st.sidebar:
-    st.header("OIICS Code Filters")
-    st.caption("Enter OIICS codes directly, then click Submit Filters.")
-    st.caption("Filters use prefix matching.")
-
-    with st.form("oiics_filter_form"):
-        nature_code = st.text_input(
-            "Nature",
-            value=st.session_state.applied_filters["nature"]
-        )
-
-        part_code = st.text_input(
-            "Part of Body",
-            value=st.session_state.applied_filters["part"]
-        )
-
-        source_code = st.text_input(
-            "Source",
-            value=st.session_state.applied_filters["source"]
-        )
-
-        event_code = st.text_input(
-            "Event",
-            value=st.session_state.applied_filters["event"]
-        )
-
-        col1, col2 = st.columns(2)
-        submit_filters = col1.form_submit_button("Submit Filters", use_container_width=True)
-        clear_filters = col2.form_submit_button("Clear Filters", use_container_width=True)
-
-    if submit_filters:
-        st.session_state.applied_filters = {
-            "nature": nature_code.strip(),
-            "part": part_code.strip(),
-            "source": source_code.strip(),
-            "event": event_code.strip(),
-        }
-        st.session_state.selected_ids = []
-        st.session_state.selected_case_dropdown = None
-        st.rerun()
-
-    if clear_filters:
-        st.session_state.applied_filters = {
-            "nature": "",
-            "part": "",
-            "source": "",
-            "event": "",
-        }
-        st.session_state.selected_ids = []
-        st.session_state.selected_case_dropdown = None
-        st.rerun()
-
-# -----------------------------
-# Apply filters to full dataset
-# -----------------------------
-filtered_full_df = full_df.copy()
-applied = st.session_state.applied_filters
-
-filtered_full_df = apply_prefix_filter(filtered_full_df, "Nature", applied["nature"])
-filtered_full_df = apply_prefix_filter(filtered_full_df, "Part of Body", applied["part"])
-filtered_full_df = apply_prefix_filter(filtered_full_df, "Source", applied["source"])
-filtered_full_df = apply_prefix_filter(filtered_full_df, "Event", applied["event"])
-
-active_filters = []
-if applied["nature"]:
-    active_filters.append(f"Nature starts with {applied['nature']}")
-if applied["part"]:
-    active_filters.append(f"Part of Body starts with {applied['part']}")
-if applied["source"]:
-    active_filters.append(f"Source starts with {applied['source']}")
-if applied["event"]:
-    active_filters.append(f"Event starts with {applied['event']}")
-
-if active_filters:
-    st.caption("Active filters: " + " | ".join(active_filters))
-
-total_rows = len(full_df)
-filtered_rows = len(filtered_full_df)
-filtered_pct = (filtered_rows / total_rows * 100) if total_rows > 0 else 0
-
-st.write(
-    f"Rows after filtering: {filtered_rows:,} / {total_rows:,} "
-    f"({filtered_pct:.2f}% of total)"
+filters.render_filter_status(
+    total_rows=len(full_df),
+    filtered_rows=len(filtered_df),
 )
 
-# -----------------------------
-# Build summaries
-# -----------------------------
-state_summary = build_state_summary(filtered_full_df)
+# ===========================================================================
+# Helper functions
+# ===========================================================================
 
-top_employers = build_top_counts(filtered_full_df, "Employer", top_n=10)
+def _update_selection(map_event, map_df: pd.DataFrame):
+    """Sync session state selected IDs from a map click event."""
+    if not (map_event.selection and map_event.selection.objects):
+        return
 
-top_events = build_top_code_title_counts(
-    filtered_full_df,
-    code_col="Event",
-    title_col="EventTitle",
-    top_n=10
-)
+    objects = map_event.selection.objects
+    new_ids = None
 
-top_sources = build_top_code_title_counts(
-    filtered_full_df,
-    code_col="Source",
-    title_col="SourceTitle",
-    top_n=10
-)
+    if objects.get("single-points"):
+        new_ids = [objects["single-points"][0]["selected_id"]]
+    elif objects.get("multi-points"):
+        new_ids = objects["multi-points"][0]["ID"]
 
-# -----------------------------
-# Build filtered map data
-# -----------------------------
-map_df = build_map_data(filtered_full_df)
+    if new_ids is None or new_ids == st.session_state.selected_ids:
+        return
 
-if map_df.empty:
-    st.warning("No rows match the current filters.")
-    st.stop()
+    valid   = set(map_df["ID"].astype(str))
+    new_ids = [i for i in new_ids if str(i) in valid]
 
-# -----------------------------
-# Group map points
-# -----------------------------
-df_grouped = map_df.groupby(["lat", "lon"])["ID"].apply(list).reset_index()
-df_grouped["count"] = df_grouped["ID"].apply(len)
-df_grouped["ID_text"] = df_grouped["ID"].apply(lambda ids: ", ".join(map(str, ids)))
+    st.session_state.selected_ids            = new_ids
+    st.session_state.selected_case_dropdown  = new_ids[0] if new_ids else None
 
-single_points = df_grouped[df_grouped["count"] == 1].copy()
-multi_points = df_grouped[df_grouped["count"] > 1].copy()
 
-if not single_points.empty:
-    single_points["selected_id"] = single_points["ID"].apply(lambda x: x[0])
-
-# -----------------------------
-# Process state GeoJSON
-# -----------------------------
-low_priority_states = {
-    "California", "Oregon", "Washington", "Nevada", "Arizona", "New Mexico",
-    "Utah", "Wyoming", "Minnesota", "Iowa", "Michigan", "Indiana", "Kentucky",
-    "Tennessee", "North Carolina", "South Carolina", "Virginia", "Maryland",
-    "Vermont", "Alaska", "Hawaii"
-}
-
-for feature in states_json["features"]:
-    state_name = feature["properties"].get("NAME")
-    is_low_priority = state_name in low_priority_states
-    feature["properties"]["fill_color"] = (
-        [180, 180, 180, 40] if is_low_priority else [65, 105, 225, 120]
-    )
-
-# -----------------------------
-# Keep selected IDs valid after filtering
-# -----------------------------
-current_id_set = set(map_df["ID"].astype(str))
-
-if st.session_state.selected_ids:
-    valid_ids = [x for x in st.session_state.selected_ids if str(x) in current_id_set]
-    if valid_ids != st.session_state.selected_ids:
-        st.session_state.selected_ids = valid_ids
-        st.session_state.selected_case_dropdown = valid_ids[0] if valid_ids else None
-
-# -----------------------------
-# Layout
-# -----------------------------
-map_col, detail_col = st.columns([2.2, 1])
-
-tooltip = {
-    "html": "<b>Entries:</b> {count}<br/><b>IDs:</b> {ID_text}"
-}
-
-layers = [
-    pdk.Layer(
-        "GeoJsonLayer",
-        id="states",
-        data=states_json,
-        stroked=True,
-        filled=True,
-        pickable=False,
-        get_fill_color="properties.fill_color",
-        get_line_color=[255, 255, 255, 120],
-        line_width_min_pixels=1,
-    )
-]
-
-if not single_points.empty:
-    layers.append(
-        pdk.Layer(
-            "ScatterplotLayer",
-            id="single-points",
-            data=single_points,
-            get_position="[lon, lat]",
-            get_color="[255, 140, 0, 180]",
-            radius_min_pixels=1,
-            get_radius=100,
-            pickable=True,
-            auto_highlight=True,
-        )
-    )
-
-if not multi_points.empty:
-    layers.append(
-        pdk.Layer(
-            "ColumnLayer",
-            id="multi-points",
-            data=multi_points,
-            get_position="[lon, lat]",
-            radius=100,
-            elevation_scale=250,
-            get_elevation="count",
-            get_fill_color="[255, 200, 0, 230]",
-            extruded=True,
-            pickable=True,
-            auto_highlight=True,
-            disk_resolution=6,
-        )
-    )
-    layers.append(
-        pdk.Layer(
-            "ScatterplotLayer",
-            id="multi-points-underside",
-            data=multi_points,
-            get_position="[lon, lat]",
-            get_color="[255, 140, 0, 180]",
-            radius_min_pixels=1,
-            get_radius=100,
-            pickable=False,
-            auto_highlight=True,
-        )
-    )
-
-deck = pdk.Deck(
-    map_style="dark",
-    initial_view_state=pdk.ViewState(
-        latitude=39.8283,
-        longitude=-98.5795,
-        zoom=3.5,
-        pitch=45,
-    ),
-    layers=layers,
-    tooltip=tooltip,
-)
-
-with map_col:
-    st.write(f"Rows mapped: {len(map_df)}")
-
-    event = st.pydeck_chart(
-        deck,
-        key="osha-map",
-        on_select="rerun",
-        selection_mode="single-object",
-        width="stretch",
-        height=700,
-    )
-
-# -----------------------------
-# Update selected IDs from map click
-# -----------------------------
-if event.selection and event.selection.objects:
-    new_selected_ids = None
-
-    if "single-points" in event.selection.objects and event.selection.objects["single-points"]:
-        obj = event.selection.objects["single-points"][0]
-        new_selected_ids = [obj["selected_id"]]
-
-    elif "multi-points" in event.selection.objects and event.selection.objects["multi-points"]:
-        obj = event.selection.objects["multi-points"][0]
-        new_selected_ids = obj["ID"]
-
-    if new_selected_ids is not None and new_selected_ids != st.session_state.selected_ids:
-        st.session_state.selected_ids = new_selected_ids
-        st.session_state.selected_case_dropdown = new_selected_ids[0] if new_selected_ids else None
-
-# -----------------------------
-# State breakdown chart
-# -----------------------------
-st.subheader("Filtered cases by state")
-
-if state_summary.empty:
-    st.info("No state data available for the current filters.")
-else:
-    normalized_low_priority_states = {state.upper() for state in low_priority_states}
-
-    chart_df = state_summary.copy()
-    chart_df["State_Normalized"] = chart_df["State"].astype("string").str.strip().str.upper()
-    chart_df["Low Priority"] = chart_df["State_Normalized"].isin(normalized_low_priority_states)
-
-    state_chart = (
-        alt.Chart(chart_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("Count:Q", title="Case Count"),
-            y=alt.Y("State:N", sort="-x", title="State"),
-            color=alt.condition(
-                alt.datum["Low Priority"],
-                alt.value("#b4b4b4"),
-                alt.value("#4169e1")
-            ),
-            tooltip=[
-                alt.Tooltip("State:N"),
-                alt.Tooltip("Count:Q"),
-                alt.Tooltip("Low Priority:N")
-            ]
-        )
-        .properties(height=900)
-    )
-
-    st.altair_chart(state_chart, use_container_width=True)
-
-    with st.expander("Show state counts table"):
-        st.dataframe(chart_df[["State", "Count"]], use_container_width=True, hide_index=True)
-
-# -----------------------------
-# Top category charts
-# -----------------------------
-st.subheader("Top filtered categories")
-
-chart_col1, chart_col2, chart_col3 = st.columns(3)
-
-with chart_col1:
-    st.markdown("**Top Employers**")
-    if top_employers.empty:
-        st.info("No employer data available.")
-    else:
-        employer_chart = (
-            alt.Chart(top_employers)
-            .mark_bar()
-            .encode(
-                x=alt.X("Count:Q", title="Case Count"),
-                y=alt.Y("Employer:N", sort="-x", title="Employer"),
-                tooltip=[
-                    alt.Tooltip("Employer:N"),
-                    alt.Tooltip("Count:Q")
-                ]
-            )
-            .properties(height=350)
-        )
-        st.altair_chart(employer_chart, use_container_width=True)
-
-with chart_col2:
-    st.markdown("**Top Events**")
-    if top_events.empty:
-        st.info("No event data available.")
-    else:
-        event_chart = (
-            alt.Chart(top_events)
-            .mark_bar()
-            .encode(
-                x=alt.X("Count:Q", title="Case Count"),
-                y=alt.Y("Label:N", sort="-x", title="Event"),
-                tooltip=[
-                    alt.Tooltip("Label:N", title="Event"),
-                    alt.Tooltip("Event:N", title="OIICS Event Code"),
-                    alt.Tooltip("Count:Q")
-                ]
-            )
-            .properties(height=350)
-        )
-        st.altair_chart(event_chart, use_container_width=True)
-
-with chart_col3:
-    st.markdown("**Top Sources**")
-    if top_sources.empty:
-        st.info("No source data available.")
-    else:
-        source_chart = (
-            alt.Chart(top_sources)
-            .mark_bar()
-            .encode(
-                x=alt.X("Count:Q", title="Case Count"),
-                y=alt.Y("Label:N", sort="-x", title="Source"),
-                tooltip=[
-                    alt.Tooltip("Label:N", title="Source"),
-                    alt.Tooltip("Source:N", title="OIICS Source Code"),
-                    alt.Tooltip("Count:Q")
-                ]
-            )
-            .properties(height=350)
-        )
-        st.altair_chart(source_chart, use_container_width=True)
-
-# -----------------------------
-# Detail panel fragment
-# -----------------------------
 @st.fragment
-def selected_case_panel(df_for_details):
+def _render_case_detail(df: pd.DataFrame):
+    """Detail panel for the currently selected map point(s)."""
     st.subheader("Selected case details")
 
     ids = st.session_state.get("selected_ids", [])
-
     if not ids:
         st.info("Click a point or column on the map to view case details.")
         return
@@ -563,47 +87,242 @@ def selected_case_panel(df_for_details):
         selected_id = ids[0]
         st.markdown(f"**Selected ID:** {selected_id}")
 
-    selected_case = df_for_details[df_for_details["ID"].astype("string") == str(selected_id)].copy()
-
-    if selected_case.empty:
+    row_df = df[df["ID"].astype("string") == str(selected_id)]
+    if row_df.empty:
         st.warning("No matching case found for the selected ID.")
         return
 
-    row = selected_case.iloc[0]
+    row = row_df.iloc[0]
 
     with st.container(border=True):
-        st.markdown("**Employer:**")
-        st.write(row.get("Employer", "N/A"))
+        _detail_field("Employer",  row.get("Employer"))
+        _detail_field("Date",      str(row.get("EventDate", ""))[:10] if pd.notna(row.get("EventDate")) else None)
 
-        if pd.notna(row.get("EventDate")) and row.get("EventDate") != "":
-            st.markdown("**Date:**")
-            st.write(row.get("EventDate", "N/A"))
+        outcomes = [c for c in OUTCOME_COLS if row.get(c, 0) == 1]
+        if outcomes:
+            _detail_field("Outcomes", ", ".join(outcomes))
 
-        st.markdown("**Injury:**")
-        st.write(row.get("NatureTitle", row.get("Nature", "N/A")))
+        _detail_field("Injury",    row.get("NatureTitle")          or row.get("Nature"))
+        _detail_field("Body Part", row.get("Part of Body Title")   or row.get("Part of Body"))
+        _detail_field("Cause",     row.get("EventTitle")           or row.get("Event"))
+        _detail_field("Source",    row.get("SourceTitle")          or row.get("Source"))
 
-        st.markdown("**Body Part:**")
-        st.write(row.get("Part of Body Title", row.get("Part of Body", "N/A")))
+        secondary = row.get("Secondary Source Title")
+        if pd.notna(secondary) and str(secondary).strip() not in ("", "<NA>"):
+            _detail_field("Source (Secondary)", secondary)
 
-        st.markdown("**Cause:**")
-        st.write(row.get("EventTitle", row.get("Event", "N/A")))
+        naics = row.get("NAICS Sector")
+        if pd.notna(naics) and str(naics).strip() not in ("", "Unknown"):
+            _detail_field("Industry", f"{naics} ({row.get('Primary NAICS', '')})")
 
-        if pd.notna(row.get("SourceTitle")) and row.get("SourceTitle") != "":
-            st.markdown("**Source:**")
-            st.write(row.get("SourceTitle", "N/A"))
+        _detail_field("Written Description", row.get("Final Narrative"))
+
+
+def _detail_field(label: str, value):
+    """Render a single labelled field in the case detail panel, skipping empty values."""
+    if value is None:
+        return
+    value = str(value).strip()
+    if value in ("", "nan", "<NA>", "N/A"):
+        return
+    st.markdown(f"**{label}:**")
+    st.write(value)
+
+
+def _render_overview_tab(df: pd.DataFrame):
+    st.subheader("Cases by state")
+
+    state_summary = data.summarize_by_state(df)
+    if state_summary.empty:
+        st.info("No state data available for the current filters.")
+    else:
+        st.altair_chart(charts.state_bar_chart(state_summary), use_container_width=True)
+        with st.expander("Show state counts table"):
+            st.dataframe(
+                state_summary[["State", "Count"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.subheader("Top categories")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**Top Employers**")
+        top_employers = data.top_counts(df, "Employer", top_n=10)
+        if top_employers.empty:
+            st.info("No employer data available.")
         else:
-            st.markdown("**Source:**")
-            st.write(row.get("Source", "N/A"))
+            st.altair_chart(charts.employer_bar_chart(top_employers), use_container_width=True)
 
-        if pd.notna(row.get("Secondary Source Title")) and row.get("Secondary Source Title") != "":
-            st.markdown("**Source (Secondary):**")
-            st.write(row.get("Secondary Source Title", "N/A"))
+    with col2:
+        st.markdown("**Top Events**")
+        top_events = data.top_code_title_counts(df, "Event", "EventTitle", top_n=10)
+        if top_events.empty:
+            st.info("No event data available.")
+        else:
+            st.altair_chart(charts.event_bar_chart(top_events), use_container_width=True)
 
-        st.markdown("**Written Description:**")
-        st.write(row.get("Final Narrative", "N/A"))
+    with col3:
+        st.markdown("**Top Sources**")
+        top_sources = data.top_code_title_counts(df, "Source", "SourceTitle", top_n=10)
+        if top_sources.empty:
+            st.info("No source data available.")
+        else:
+            st.altair_chart(charts.source_bar_chart(top_sources), use_container_width=True)
 
-# -----------------------------
-# Render detail panel
-# -----------------------------
+
+def _render_trends_tab(df: pd.DataFrame):
+
+    # -- Time series --
+    st.subheader("Cases over time")
+
+    ts_left, ts_right = st.columns([3, 1])
+
+    with ts_right:
+        granularity = st.radio("Granularity", options=["Month", "Quarter", "Year"], index=1)
+        show_outcomes = st.multiselect("Overlay outcomes", options=OUTCOME_COLS, default=[])
+
+    time_df = data.build_time_series(df, granularity)
+
+    with ts_left:
+        if time_df.empty:
+            st.info("No date data available for the current filters.")
+        else:
+            st.altair_chart(
+                charts.time_series_chart(time_df, show_outcomes),
+                use_container_width=True,
+            )
+            st.caption(
+                "Solid blue = total cases. "
+                + ("Dashed lines = selected outcome overlays."
+                   if show_outcomes
+                   else "Select outcomes above to overlay Hospitalized / Amputation / Loss of Eye.")
+            )
+
+    st.divider()
+
+    # -- Outcome breakdown --
+    st.subheader("Injury outcomes by state")
+
+    ob_left, ob_right = st.columns([3, 1])
+
+    with ob_right:
+        dimension = st.radio("Break down by", options=["State", "NAICS Sector", "Employer"], index=0)
+        top_n     = st.slider("Show top N", min_value=5, max_value=25, value=15)
+
+    outcome_df = data.build_outcome_breakdown(df, dimension, top_n)
+
+    with ob_left:
+        if outcome_df.empty:
+            st.info("No outcome data available for the current filters.")
+        else:
+            st.altair_chart(
+                charts.outcome_breakdown_chart(outcome_df, dimension, top_n),
+                use_container_width=True,
+            )
+
+    st.divider()
+
+    # -- NAICS industry breakdown --
+    st.subheader("Cases by industry (NAICS sector)")
+
+    naics_df = data.build_naics_breakdown(df)
+    if naics_df.empty:
+        st.info("No NAICS data available for the current filters.")
+    else:
+        st.altair_chart(charts.naics_bar_chart(naics_df), use_container_width=True)
+
+    st.divider()
+
+    # -- CSV export --
+    st.subheader("Export filtered data")
+
+    export_cols = [
+        "ID", "EventDate", "Employer", "State", "City",
+        "Hospitalized", "Amputation", "Loss of Eye",
+        "NatureTitle", "Part of Body Title", "EventTitle", "SourceTitle",
+        "NAICS Sector", "Primary NAICS", "Final Narrative",
+    ]
+    export_cols = [c for c in export_cols if c in df.columns]
+    export_df   = df[export_cols].copy()
+
+    if "EventDate" in export_df.columns:
+        export_df["EventDate"] = export_df["EventDate"].astype(str).str[:10]
+
+    st.download_button(
+        label=f"Download {len(df):,} filtered rows as CSV",
+        data=export_df.to_csv(index=False).encode("utf-8"),
+        file_name="osha_filtered_export.csv",
+        mime="text/csv",
+    )
+
+    show_avg = st.checkbox("Show rolling average", value=True)
+    time_df = data.build_time_series(df, granularity)
+    time_df = data.add_rolling_average(time_df)
+
+    st.altair_chart(
+        charts.time_series_with_avg_chart(time_df, show_avg),
+        use_container_width=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Map
+# ---------------------------------------------------------------------------
+
+map_df = data.build_map_points(filtered_df)
+
+if map_df.empty:
+    st.warning("No rows match the current filters.")
+    st.stop()
+
+single_points, multi_points = map_utils.group_map_points(map_df)
+annotated_states             = map_utils.annotate_state_geojson(states_json)
+layers                       = map_utils.build_map_layers(annotated_states, single_points, multi_points)
+
+deck = pdk.Deck(
+    map_style="dark",
+    initial_view_state=pdk.ViewState(
+        latitude=39.8283,
+        longitude=-98.5795,
+        zoom=3.5,
+        pitch=45,
+    ),
+    layers=layers,
+    tooltip={"html": "<b>Entries:</b> {count}<br/><b>IDs:</b> {ID_text}"},
+)
+
+# ---------------------------------------------------------------------------
+# Layout: map + detail panel
+# ---------------------------------------------------------------------------
+
+map_col, detail_col = st.columns([2.2, 1])
+
+with map_col:
+    st.write(f"Rows mapped: {len(map_df)}")
+    map_event = st.pydeck_chart(
+        deck,
+        key="osha-map",
+        on_select="rerun",
+        selection_mode="single-object",
+        width="stretch",
+        height=700,
+    )
+
+_update_selection(map_event, map_df)
+
 with detail_col:
-    selected_case_panel(filtered_full_df)
+    _render_case_detail(filtered_df)
+
+# ---------------------------------------------------------------------------
+# Analytics tabs
+# ---------------------------------------------------------------------------
+
+tab_overview, tab_trends = st.tabs(["Overview", "Trends & Industries"])
+
+with tab_overview:
+    _render_overview_tab(filtered_df)
+
+with tab_trends:
+    _render_trends_tab(filtered_df)
